@@ -5,84 +5,95 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium_stealth import stealth
 import time
 import urllib.parse
 from utils import get_base_domain, find_social_links
 from pocketbase import send_to_pocketbase
-import requests
 from bs4 import BeautifulSoup
-import time
-from urllib.parse import urlparse
-from furl import furl
+import logging
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-from bs4 import BeautifulSoup
-import urllib.parse
-import time
-from utils import get_base_domain, find_social_links
-from pocketbase import send_to_pocketbase
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Define blacklisted domains and keywords
 BLACKLISTED_DOMAINS = {"google.com", "opentable.com", "treatwell.de"}
 BLACKLISTED_KEYWORDS = {"book"}
 
-def scrape_google_maps(search_query):
-    # Set up Chrome options
+def setup_driver():
+    """Sets up the Chrome WebDriver with options and stealth settings."""
     chrome_options = Options()
+    # chrome_options.add_argument("--headless")  # Run headless if you don't need a GUI
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
     
-    with webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options) as driver:
-        try:
-            # Construct the Google Maps search URL
-            encoded_query = urllib.parse.quote_plus(search_query)
-            url = f"https://www.google.com/maps/search/{encoded_query}"
-            driver.get(url)
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, '[role="feed"]')))
-            
-            # Scroll to load all businesses
-            scrollable_div = driver.find_element(By.CSS_SELECTOR, '[role="feed"]')
-            previous_height = driver.execute_script('return arguments[0].scrollHeight', scrollable_div)
-            while True:
-                driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable_div)
-                time.sleep(2)
-                new_height = driver.execute_script('return arguments[0].scrollHeight', scrollable_div)
-                if new_height == previous_height:
-                    break
-                previous_height = new_height
-            
-            # Extract links to business pages
-            business_links = driver.find_elements(By.CSS_SELECTOR, '[role="feed"] > div > div > a')
-            links = [link.get_attribute('href') for link in business_links]
-            
-            for link in links:
+    # Apply Selenium Stealth
+    stealth(driver,
+            languages=["en-US", "en"],
+            vendor="Google Inc.",
+            platform="Win32",
+            webgl_vendor="Intel Inc.",
+            renderer="Intel Iris OpenGL Engine",
+            fix_hairline=True)
+    
+    return driver
+
+def scrape_google_maps(search_query):
+    """Scrapes Google Maps for business links based on the search query."""
+    driver = setup_driver()
+    try:
+        encoded_query = urllib.parse.quote_plus(search_query)
+        url = f"https://www.google.com/maps/search/{encoded_query}"
+        logging.info(f"Navigating to URL: {url}")
+        driver.get(url)
+
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, '[role="feed"]')))
+        scrollable_div = driver.find_element(By.CSS_SELECTOR, '[role="feed"]')
+        previous_height = driver.execute_script('return arguments[0].scrollHeight', scrollable_div)
+
+        while True:
+            driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable_div)
+            time.sleep(2)
+            new_height = driver.execute_script('return arguments[0].scrollHeight', scrollable_div)
+            if new_height == previous_height:
+                break
+            previous_height = new_height
+
+        business_links = driver.find_elements(By.CSS_SELECTOR, '[role="feed"] > div > div > a')
+        links = [link.get_attribute('href') for link in business_links if link.get_attribute('href')]
+
+        for link in links:
+            try:
                 driver.get(link)
                 WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
                 title = driver.find_element(By.TAG_NAME, 'h1').text.strip()
                 if not title:
                     continue
-                
-                # Extract the website using BeautifulSoup
+
                 page_source = driver.page_source
                 soup = BeautifulSoup(page_source, 'html.parser')
-                website = next((a['href'] for a in soup.find_all('a', href=True) 
+                website = next((a['href'] for a in soup.find_all('a', href=True)
                                 if not any(domain in a['href'] for domain in BLACKLISTED_DOMAINS)), None)
+
                 if not website or any(keyword in website for keyword in BLACKLISTED_KEYWORDS):
                     continue
-                
+
                 base_domain = get_base_domain(website)
                 social_links = find_social_links(base_domain)
-                if social_links['instagram'] or social_links['facebook']:
-                    send_to_pocketbase(title, base_domain, social_links['instagram'], social_links['facebook'])
-        
-        except Exception as e:
-            print(f"Error processing query {search_query}: {e}")
+
+                if social_links.get('instagram') or social_links.get('facebook'):
+                    send_to_pocketbase(title, base_domain, social_links.get('instagram'), social_links.get('facebook'))
+            except Exception as e:
+                logging.error(f"Error processing link {link}: {e}")
+
+    except Exception as e:
+        logging.error(f"Error processing query {search_query}: {e}")
+    finally:
+        driver.quit()
 
 def main():
     search_queries = {
@@ -173,9 +184,9 @@ def main():
         "query85": "nagel studio in zwickau",
         # Note: The list can be expanded or refined as necessary.
     }
-    # Loop through the dictionary and scrape each query
+
     for query_name, search_query in search_queries.items():
-        print(f"Processing {query_name}: {search_query}")
+        logging.info(f"Processing {query_name}: {search_query}")
         scrape_google_maps(search_query)
 
 if __name__ == "__main__":
